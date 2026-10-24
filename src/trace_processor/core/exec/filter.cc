@@ -129,9 +129,15 @@ void CompareByOp(const Op& op,
       return Compare<T, Gt>(column, cast, pool, r);
     case Op::GetTypeIndex<Ge>():
       return Compare<T, Ge>(column, cast, pool, r);
+    case Op::GetTypeIndex<Glob>():
+      if constexpr (std::is_same_v<T, String>) {
+        return Compare<T, Glob>(column, cast, pool, r);
+      }
+      break;
     default:
-      PERFETTO_FATAL("Unsupported filter operator");
+      break;
   }
+  PERFETTO_FATAL("Unsupported filter operator");
 }
 
 // Drops the nulls, which no comparison or IN is true of, as the interpreter
@@ -228,7 +234,7 @@ Filter::Filter(std::vector<Condition> conditions, const StringPool* pool)
     : conditions_(std::move(conditions)), pool_(pool) {
   for (const Condition& c : conditions_) {
     PERFETTO_CHECK(c.op.IsAnyOf<NonStringOp>() || c.op.IsAnyOf<NullOp>() ||
-                   c.op.Is<In>());
+                   c.op.Is<In>() || c.op.Is<Glob>());
   }
 }
 
