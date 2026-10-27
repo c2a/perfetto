@@ -35,6 +35,8 @@
 #include "src/trace_processor/core/exec/filter.h"
 #include "src/trace_processor/core/exec/filter_value.h"
 #include "src/trace_processor/perfetto_sql/pipeline/compiler.h"
+#include "src/trace_processor/perfetto_sql/pipeline/logical_plan.h"
+#include "src/trace_processor/perfetto_sql/pipeline/operations/scan.h"
 #include "src/trace_processor/perfetto_sql/pipeline/physical_plan.h"
 #include "src/trace_processor/perfetto_sql/pipeline/plan_serialization.h"
 
@@ -348,35 +350,86 @@ std::optional<uint32_t> Where::Prune(std::vector<bool>* needed) {
 }
 
 void Where::Lower(Lowering* c, const PlanNode& node) const {
-  c->LowerNode(node.children()[0]);
+  // A scan converts no column, so the values can be cast for the columns as
+  // it reads them before it is lowered; any other input may convert them.
+  const PlanNode& child = c->plan().nodes()[node.children()[0]];
+  bool scan = child.Is<Scan>();
+  if (!scan) {
+    c->LowerNode(node.children()[0]);
+  }
+
+  // Filter reads only columns of one type, but for IS [NOT] NULL. A column of
+  // no known type carries a type per row, so it is converted to the literals'
+  // type. GLOB matches only strings.
+  std::vector<std::optional<core::StorageType>> converted(predicates_.size());
+  std::vector<std::optional<ex::FilterValue>> values(predicates_.size());
+  for (uint32_t i = 0; i < predicates_.size(); ++i) {
+    const WherePredicate& p = predicates_[i];
+    std::optional<core::StorageType> type = c->QueryType(p.column).storage();
+    std::optional<core::StorageType> wanted = TypeForLiterals(p, literals_);
+    if (wanted &&
+        (!type || (p.op.Is<core::Glob>() && !type->Is<core::String>()))) {
+      type = wanted;
+      converted[i] = wanted;
+    }
+    if (!type || p.op.IsAnyOf<core::NullOp>()) {
+      continue;
+    }
+    LiteralFetcher fetcher(literals_.data() + p.first_literal, p.literal_count,
+                           strings_);
+    ex::FilterValue value;
+    if (p.op.Is<core::In>()) {
+      ex::GetFilterValueListCaster<LiteralFetcher> (*type)(
+          fetcher, 0, *c->context().pool, &value);
+    } else {
+      ex::GetFilterValueCaster<LiteralFetcher>(*type, p.op)(
+          fetcher, 0, *c->context().pool, &value);
+    }
+    values[i] = std::move(value);
+  }
+
+  // The scan answers what conditions on its columns, as read, it can by
+  // searching instead of testing each row.
+  std::vector<bool> answered(predicates_.size(), false);
+  if (scan) {
+    std::vector<Scan::Condition> searchable;
+    std::vector<uint32_t> of;
+    for (uint32_t i = 0; i < predicates_.size(); ++i) {
+      if (values[i] && !converted[i]) {
+        searchable.push_back(
+            {predicates_[i].column, predicates_[i].op, std::move(*values[i])});
+        of.push_back(i);
+      }
+    }
+    std::vector<bool> searched =
+        child.Cast<Scan>().LowerSearching(c, &searchable);
+    for (uint32_t j = 0; j < of.size(); ++j) {
+      answered[of[j]] = searched[j];
+      if (!searched[j]) {
+        values[of[j]] = std::move(searchable[j].value);
+      }
+    }
+  }
+
   std::vector<ex::Filter::Condition> conditions;
-  for (const WherePredicate& p : predicates_) {
+  for (uint32_t i = 0; i < predicates_.size(); ++i) {
+    if (answered[i]) {
+      continue;
+    }
+    const WherePredicate& p = predicates_[i];
+    if (converted[i]) {
+      c->RequireType(p.column, *converted[i]);
+    }
     ex::Filter::Condition condition;
     condition.column = c->QueryPosition(p.column);
     condition.op = p.op;
-    // Filter reads only columns of one type, but for IS [NOT] NULL. A column
-    // of no known type carries a type per row, so it is converted to the
-    // literals' type. GLOB matches only strings.
-    std::optional<core::StorageType> type = c->QueryType(p.column).storage();
-    std::optional<core::StorageType> wanted = TypeForLiterals(p, literals_);
-    if (wanted && (!type || p.op.Is<core::Glob>())) {
-      type = wanted;
-      c->RequireType(p.column, *type);
-    }
-    if (type && !p.op.IsAnyOf<core::NullOp>()) {
-      LiteralFetcher fetcher(literals_.data() + p.first_literal,
-                             p.literal_count, strings_);
-      ex::FilterValue value;
-      if (p.op.Is<core::In>()) {
-        ex::GetFilterValueListCaster<LiteralFetcher> (*type)(
-            fetcher, 0, *c->context().pool, &value);
-      } else {
-        ex::GetFilterValueCaster<LiteralFetcher>(*type, p.op)(
-            fetcher, 0, *c->context().pool, &value);
-      }
-      condition.value = c->AddFilterValue(std::move(value));
+    if (values[i]) {
+      condition.value = c->AddFilterValue(std::move(*values[i]));
     }
     conditions.push_back(condition);
+  }
+  if (conditions.empty()) {
+    return;
   }
   c->AddOperator(
       std::make_unique<ex::Filter>(std::move(conditions), c->context().pool));

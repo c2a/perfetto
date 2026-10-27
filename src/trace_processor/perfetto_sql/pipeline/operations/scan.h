@@ -25,7 +25,9 @@
 #include <vector>
 
 #include "perfetto/ext/base/status_or.h"
+#include "src/trace_processor/core/common/op_types.h"
 #include "src/trace_processor/core/dataframe/types.h"
+#include "src/trace_processor/core/exec/filter_value.h"
 #include "src/trace_processor/perfetto_sql/pipeline/logical_plan.h"
 #include "src/trace_processor/perfetto_sql/pipeline/plan_types.h"
 #include "src/trace_processor/sqlite/sql_source.h"
@@ -74,6 +76,9 @@ struct ScanDataframe {
   uint64_t stamp = 0;
   // Resolved at compile time; only the selected columns are retained.
   std::vector<std::shared_ptr<const dataframe::Column>> columns;
+  // Resolved with the columns: the dataframe's indexes, which a WHERE on the
+  // scan can search instead of testing every row.
+  std::vector<dataframe::Index> indexes;
   uint32_t row_count = 0;
 };
 
@@ -99,6 +104,21 @@ class Scan : public PlanOperation {
   std::unique_ptr<core::exec::Source> MakeSource() const;
 
   const std::vector<NamedColumn>& columns() const { return columns_; }
+
+  // A WHERE condition on one of the scan's columns, with its value cast for
+  // the column's storage type.
+  struct Condition {
+    ColumnId column = 0;
+    core::Op op{core::Eq{}};
+    core::exec::FilterValue value;
+  };
+  // Lowers the scan, answering what it can of `conditions` by searching the
+  // dataframe instead of testing its rows: binary searches of sorted columns,
+  // else an index, or no rows at all if a condition can match none. Returns,
+  // by condition, whether it was answered, taking the values of those which
+  // were; the rest are left for a Filter after the scan.
+  std::vector<bool> LowerSearching(Lowering*,
+                                   std::vector<Condition>* conditions) const;
 
  private:
   using Dataframe = ScanDataframe;
@@ -165,6 +185,14 @@ class Scan : public PlanOperation {
       uint32_t from,
       const perfetto_sql::analysis::RelationLineage& lineage);
   static void AddScanColumn(Compiler*, Scan* scan, NameId name, PlanType type);
+  // Resolves the dataframe columns and indexes the scan reads.
+  static void ResolveColumns(const dataframe::Dataframe&, Dataframe* data);
+
+  // Declares the scan's columns, then sets `source`. Unless `reordered`, the
+  // rows are in the dataframe's order, so the columns it keeps sorted ascend.
+  void SetSource(Lowering*,
+                 std::unique_ptr<core::exec::Source> source,
+                 bool reordered) const;
 
   const OperationRegistration& registration() const override;
 

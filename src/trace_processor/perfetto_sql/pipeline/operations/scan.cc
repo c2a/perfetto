@@ -37,12 +37,20 @@
 #include "perfetto/ext/base/variant.h"
 #include "src/perfetto_sql/analysis/relation.h"
 #include "src/perfetto_sql/syntaqlite/syntaqlite_perfetto.h"
+#include "src/trace_processor/containers/string_pool.h"
+#include "src/trace_processor/core/common/filter_value_cast.h"
+#include "src/trace_processor/core/common/op_types.h"
 #include "src/trace_processor/core/common/storage_types.h"
 #include "src/trace_processor/core/dataframe/adhoc_dataframe_builder.h"
 #include "src/trace_processor/core/dataframe/dataframe.h"
+#include "src/trace_processor/core/dataframe/logical_plan.h"
 #include "src/trace_processor/core/dataframe/specs.h"
 #include "src/trace_processor/core/dataframe/types.h"
 #include "src/trace_processor/core/exec/dataframe_scan.h"
+#include "src/trace_processor/core/exec/empty_source.h"
+#include "src/trace_processor/core/exec/filter_value.h"
+#include "src/trace_processor/core/exec/index_scan.h"
+#include "src/trace_processor/core/exec/sorted_scan.h"
 #include "src/trace_processor/core/util/bit_vector.h"
 #include "src/trace_processor/perfetto_sql/pipeline/compiler.h"
 #include "src/trace_processor/perfetto_sql/pipeline/physical_plan.h"
@@ -258,8 +266,8 @@ Scan Scan::BuildDataframeScan(Compiler* c,
                         ColumnType(dataframe, column.index));
     source.read.push_back(
         {column.index, c->Name(dataframe.column_names()[column.index])});
-    source.columns.push_back(dataframe.shared_column(column.index));
   }
+  ResolveColumns(dataframe, &source);
   scan.source_ = std::move(source);
   return scan;
 }
@@ -386,20 +394,117 @@ std::optional<uint32_t> Scan::Prune(std::vector<bool>* needed) {
 }
 
 void Scan::Lower(Lowering* c, const PlanNode&) const {
-  const auto& scan = *this;
+  SetSource(c, MakeSource(), /*reordered=*/false);
+}
 
+void Scan::SetSource(Lowering* c,
+                     std::unique_ptr<ex::Source> source,
+                     bool reordered) const {
   PERFETTO_DCHECK(!c->has_source());
-  for (const NamedColumn& column : scan.columns_) {
+  for (const NamedColumn& column : columns_) {
     c->DeclareColumn(column.id);
   }
-  c->SetSource(scan.MakeSource());
+  c->SetSource(std::move(source));
+  if (reordered) {
+    return;
+  }
   // A dataframe is read in order, so a column it keeps sorted ascends.
-  const auto& dataframe = base::unchecked_get<Scan::Dataframe>(scan.source_);
-  for (uint32_t i = 0; i < scan.columns_.size(); ++i) {
+  const auto& dataframe = base::unchecked_get<Scan::Dataframe>(source_);
+  for (uint32_t i = 0; i < columns_.size(); ++i) {
     if (!dataframe.columns[i]->sort_state.Is<core::Unsorted>()) {
-      c->DeclareSorted({{scan.columns_[i].id, false}});
+      c->DeclareSorted({{columns_[i].id, false}});
     }
   }
+}
+
+std::vector<bool> Scan::LowerSearching(
+    Lowering* c,
+    std::vector<Condition>* conditions) const {
+  const auto& data = base::unchecked_get<Scan::Dataframe>(source_);
+  std::vector<Condition>& conds = *conditions;
+  std::vector<bool> answered(conds.size(), false);
+  const StringPool* pool = c->context().pool;
+  // A condition no row can match leaves nothing to read.
+  for (const Condition& cond : conds) {
+    if (cond.value.value.validity ==
+        core::filter::CastFilterValueResult::kNoneMatch) {
+      SetSource(c, std::make_unique<ex::EmptySource>(), /*reordered=*/false);
+      answered.assign(conds.size(), true);
+      return answered;
+    }
+  }
+  std::vector<uint32_t> positions;
+  for (const Condition& cond : conds) {
+    auto it = std::find_if(
+        columns_.begin(), columns_.end(),
+        [&](const NamedColumn& column) { return column.id == cond.column; });
+    PERFETTO_CHECK(it != columns_.end());
+    positions.push_back(static_cast<uint32_t>(it - columns_.begin()));
+  }
+
+  // Each sorted column narrows the rows to a range, which stays in order.
+  std::vector<ex::SortedScan::Search> searches;
+  for (uint32_t i = 0; i < conds.size(); ++i) {
+    const auto& column = data.columns[positions[i]];
+    std::optional<dataframe::logical::FilterStrategy> strategy =
+        dataframe::SortedFilterStrategy(*column, conds[i].op);
+    if (!strategy) {
+      continue;
+    }
+    ex::SortedScan::Search search;
+    search.column = column;
+    search.op = conds[i].op;
+    if (std::holds_alternative<dataframe::logical::SetIdSortedSearch>(
+            *strategy)) {
+      search.kind = ex::SortedScan::Search::Kind::kSetIdEq;
+    } else if (std::holds_alternative<dataframe::logical::SmallValueLookup>(
+                   *strategy)) {
+      search.kind = ex::SortedScan::Search::Kind::kSmallValueEq;
+    } else {
+      PERFETTO_DCHECK(
+          std::holds_alternative<dataframe::logical::BinarySearch>(*strategy));
+      search.kind = ex::SortedScan::Search::Kind::kBinarySearch;
+    }
+    search.value = c->AddFilterValue(std::move(conds[i].value));
+    searches.push_back(std::move(search));
+    answered[i] = true;
+  }
+  if (!searches.empty()) {
+    SetSource(c,
+              std::make_unique<ex::SortedScan>(data.columns, data.row_count,
+                                               std::move(searches), pool),
+              /*reordered=*/false);
+    return answered;
+  }
+
+  // Otherwise an index finds equalities on its leading columns, in index
+  // order rather than the dataframe's.
+  std::vector<dataframe::FilterSpec> specs;
+  std::vector<uint8_t> unsearchable;
+  for (uint32_t i = 0; i < conds.size(); ++i) {
+    specs.push_back({data.read[positions[i]].index, i, conds[i].op, {}});
+    bool id = data.columns[positions[i]]->storage.type().Is<core::Id>();
+    unsearchable.push_back(!conds[i].op.Is<core::Eq>() || id);
+  }
+  std::optional<dataframe::BestIndex> best =
+      dataframe::GetBestIndexForFilterSpecs(data.row_count, specs, unsearchable,
+                                            data.indexes);
+  if (!best) {
+    SetSource(c, MakeSource(), /*reordered=*/false);
+    return answered;
+  }
+  std::vector<ex::IndexScan::Equality> equalities;
+  for (uint32_t i : best->best_index_specs) {
+    equalities.push_back({data.columns[positions[i]],
+                          c->AddFilterValue(std::move(conds[i].value))});
+    answered[i] = true;
+  }
+  SetSource(c,
+            std::make_unique<ex::IndexScan>(data.columns,
+                                            data.indexes[best->best_index_idx],
+                                            std::move(equalities), pool),
+            /*reordered=*/true);
+  return answered;
 }
 
 std::unique_ptr<ex::Source> Scan::MakeSource() const {
@@ -452,12 +557,30 @@ base::Status Scan::ResolveDataframes(LogicalPlan*,
         "Pipeline: table '%s' has changed since the pipeline was written",
         data->name.c_str());
   }
-  PERFETTO_NO_VECTORIZE_LOOP
-  for (const ScanDataframeColumn& column : data->read) {
-    data->columns.push_back(dataframe->shared_column(column.index));
-  }
-  data->row_count = dataframe->row_count();
+  ResolveColumns(*dataframe, data);
   return base::OkStatus();
+}
+
+void Scan::ResolveColumns(const dataframe::Dataframe& dataframe,
+                          Dataframe* data) {
+  data->columns.clear();
+  for (const ScanDataframeColumn& column : data->read) {
+    data->columns.push_back(dataframe.shared_column(column.index));
+  }
+  // An index is only searchable on columns the scan reads.
+  data->indexes.clear();
+  for (const dataframe::Index& index : dataframe.indexes()) {
+    bool read = std::all_of(
+        index.columns().begin(), index.columns().end(), [&](uint32_t i) {
+          return std::any_of(
+              data->read.begin(), data->read.end(),
+              [i](const ScanDataframeColumn& c) { return c.index == i; });
+        });
+    if (read) {
+      data->indexes.push_back(index.Copy());
+    }
+  }
+  data->row_count = dataframe.row_count();
 }
 
 base::Status Scan::BindDataframeArgs(
