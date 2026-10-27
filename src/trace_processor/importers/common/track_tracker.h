@@ -27,6 +27,7 @@
 #include "perfetto/base/compiler.h"
 #include "perfetto/ext/base/flat_hash_map.h"
 #include "perfetto/ext/base/hash.h"
+#include "perfetto/ext/base/murmur_hash.h"
 #include "perfetto/ext/base/string_view.h"
 #include "perfetto/public/compiler.h"
 #include "src/trace_processor/containers/string_pool.h"
@@ -45,6 +46,26 @@ namespace perfetto::trace_processor {
 class TrackTracker {
  public:
   using SetArgsCallback = std::function<void(ArgsInserter&)>;
+
+  // Fully keyed runtime dimensions. Keys must be distinct from the blueprint
+  // dimensions, and the hash covers only canonical keys and typed values.
+  struct AdditionalDimensions {
+    const ArgsTracker::CompactArg* data;
+    uint32_t size;
+    uint64_t hash;
+  };
+
+  static uint64_t HashWithAdditionalDimensions(
+      uint64_t hash,
+      AdditionalDimensions additional) {
+    if (additional.size == 0) {
+      return hash;
+    }
+    base::MurmurHashCombiner combiner;
+    combiner.Combine(hash);
+    combiner.Combine(additional.hash);
+    return combiner.digest();
+  }
 
   explicit TrackTracker(TraceProcessorContext*);
 
@@ -101,7 +122,18 @@ class TrackTracker {
       const typename BlueprintT::name_t& name = tracks::BlueprintName(),
       const SetArgsCallback& args = {},
       const typename BlueprintT::unit_t& unit = tracks::BlueprintUnit()) {
-    return InternTrackInner(bp, dims, name, args, unit);
+    return InternTrackInner(bp, dims, name, args, unit, {});
+  }
+
+  template <typename BlueprintT>
+  TrackId InternTrackWithDimensions(
+      const BlueprintT& bp,
+      const typename BlueprintT::dimensions_t& dims,
+      AdditionalDimensions additional,
+      const typename BlueprintT::name_t& name = tracks::BlueprintName(),
+      const SetArgsCallback& args = {},
+      const typename BlueprintT::unit_t& unit = tracks::BlueprintUnit()) {
+    return InternTrackInner(bp, dims, name, args, unit, additional);
   }
 
   // Wrapper function for `InternTrack` in cases where you want the "main"
@@ -129,7 +161,8 @@ class TrackTracker {
       const typename BlueprintT::dimensions_t& dims,
       const typename BlueprintT::name_t& name = tracks::BlueprintName(),
       const SetArgsCallback& args = {},
-      const typename BlueprintT::unit_t& unit = tracks::BlueprintUnit()) {
+      const typename BlueprintT::unit_t& unit = tracks::BlueprintUnit(),
+      AdditionalDimensions additional = {}) {
     std::array<ArgsTracker::CompactArg, 8> a;
     DimensionsToArgs<0>(dims, bp.dimension_blueprints.data(), a.data());
     StringId n;
@@ -181,7 +214,8 @@ class TrackTracker {
     base::ignore_result(name, unit);
     static constexpr uint32_t kDimensionCount =
         std::tuple_size_v<typename BlueprintT::dimensions_t>;
-    return AddTrack(bp, n, u, desc, a.data(), kDimensionCount, args);
+    return AddTrack(bp, n, u, desc, a.data(), kDimensionCount, args,
+                    additional);
   }
 
  private:
@@ -194,19 +228,22 @@ class TrackTracker {
                    StringId,
                    ArgsTracker::CompactArg*,
                    uint32_t,
-                   const SetArgsCallback&);
+                   const SetArgsCallback&,
+                   AdditionalDimensions);
 
   template <typename BlueprintT>
-  PERFETTO_ALWAYS_INLINE TrackId InternTrackInner(
-      const BlueprintT& bp,
-      const typename BlueprintT::dimensions_t& dims = {},
-      const typename BlueprintT::name_t& name = tracks::BlueprintName(),
-      const SetArgsCallback& args = {},
-      const typename BlueprintT::unit_t& unit = tracks::BlueprintUnit()) {
-    uint64_t hash = tracks::HashFromBlueprintAndDimensions(bp, dims);
+  PERFETTO_ALWAYS_INLINE TrackId
+  InternTrackInner(const BlueprintT& bp,
+                   const typename BlueprintT::dimensions_t& dims,
+                   const typename BlueprintT::name_t& name,
+                   const SetArgsCallback& args,
+                   const typename BlueprintT::unit_t& unit,
+                   AdditionalDimensions additional) {
+    uint64_t hash = HashWithAdditionalDimensions(
+        tracks::HashFromBlueprintAndDimensions(bp, dims), additional);
     auto [it, inserted] = tracks_.Insert(hash, {});
     if (inserted) {
-      *it = CreateTrack(bp, dims, name, args, unit);
+      *it = CreateTrack(bp, dims, name, args, unit, additional);
     }
     return *it;
   }

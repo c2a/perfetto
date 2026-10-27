@@ -18282,6 +18282,7 @@ filegroup {
     name: "perfetto_src_trace_processor_importers_common_unittests",
     srcs: [
         "src/trace_processor/importers/common/address_range_unittest.cc",
+        "src/trace_processor/importers/common/args_tracker_unittest.cc",
         "src/trace_processor/importers/common/args_translation_table_unittest.cc",
         "src/trace_processor/importers/common/clock_converter_unittest.cc",
         "src/trace_processor/importers/common/clock_tracker_unittest.cc",

@@ -30,6 +30,7 @@
 #include "src/trace_processor/core/dataframe/specs.h"
 #include "src/trace_processor/importers/common/args_translation_table.h"
 #include "src/trace_processor/types/variadic.h"
+#include "src/trace_processor/util/args_utils.h"
 
 namespace perfetto::trace_processor {
 
@@ -64,6 +65,33 @@ void WriteArgSetId(dataframe::Dataframe* df,
 }  // namespace
 
 ArgsTracker::ArgsTracker(TraceStorage* storage) : storage_(storage) {}
+
+ArgSetId ArgsTracker::ExtendArgSet(std::optional<ArgSetId> base,
+                                   const CompactArg* args,
+                                   uint32_t count) {
+  CompactArgSet combined;
+  if (base) {
+    auto cursor = storage_->arg_table().CreateCursor(
+        {dataframe::FilterSpec{tables::ArgTable::ColumnIndex::arg_set_id, 0,
+                               dataframe::Eq{}, std::nullopt}});
+    cursor.SetFilterValueUnchecked(0, *base);
+    for (cursor.Execute(); !cursor.Eof(); cursor.Next()) {
+      combined.emplace_back(CompactArg{cursor.flat_key(), cursor.key(),
+                                       GetArgValue(*storage_, cursor)});
+    }
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    auto existing = std::find_if(
+        combined.begin(), combined.end(),
+        [&](const CompactArg& arg) { return arg.key == args[i].key; });
+    if (existing == combined.end()) {
+      combined.emplace_back(args[i]);
+    } else if (args[i].update_policy == UpdatePolicy::kAddOrUpdate) {
+      *existing = args[i];
+    }
+  }
+  return AddArgSet(combined.data(), static_cast<uint32_t>(combined.size()));
+}
 
 ArgsInserter ArgsTracker::AddArgsTo(MetadataId id) {
   auto* table = storage_->mutable_metadata_table();

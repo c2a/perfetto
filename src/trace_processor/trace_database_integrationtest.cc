@@ -1422,7 +1422,9 @@ TEST_F(TraceProcessorIntegrationTest, PerfettoExportRoundTrip) {
   int64_t slice_dur_sum =
       QuerySingleInt(Processor(), "SELECT sum(dur) FROM slice");
   int64_t dimension_count =
-      QuerySingleInt(Processor(), "SELECT count() FROM track_dimension");
+      QuerySingleInt(Processor(),
+                     "SELECT count() FROM track AS t JOIN args AS a "
+                     "ON a.arg_set_id = t.dimension_arg_set_id");
   const std::string arg_lookup =
       "SELECT extract_arg(a.arg_set_id, a.key) = a.int_value FROM args AS a "
       "WHERE a.int_value IS NOT NULL "
@@ -1447,9 +1449,10 @@ TEST_F(TraceProcessorIntegrationTest, PerfettoExportRoundTrip) {
             "{}");
   ASSERT_OK(ParsePerfettoExport(reimport.get(), tar));
   EXPECT_EQ(QuerySingleInt(reimport.get(), arg_lookup), 1);
-  EXPECT_EQ(
-      QuerySingleInt(reimport.get(), "SELECT count() FROM track_dimension"),
-      dimension_count);
+  EXPECT_EQ(QuerySingleInt(reimport.get(),
+                           "SELECT count() FROM track AS t JOIN args AS a "
+                           "ON a.arg_set_id = t.dimension_arg_set_id"),
+            dimension_count);
 
   EXPECT_EQ(QuerySingleInt(reimport.get(), "SELECT count() FROM thread"),
             thread_count);

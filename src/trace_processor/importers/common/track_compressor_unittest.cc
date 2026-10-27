@@ -16,7 +16,10 @@
 
 #include "src/trace_processor/importers/common/track_compressor.h"
 
+#include <limits>
 #include <memory>
+#include <string>
+#include <utility>
 
 #include "src/trace_processor/importers/common/args_tracker.h"
 #include "src/trace_processor/importers/common/global_stats_tracker.h"
@@ -28,6 +31,7 @@
 #include "src/trace_processor/importers/common/tracks_common.h"
 #include "src/trace_processor/storage/trace_storage.h"
 #include "src/trace_processor/types/trace_processor_context.h"
+#include "src/trace_processor/util/args_utils.h"
 #include "test/gtest_and_gmock.h"
 
 namespace perfetto::trace_processor {
@@ -66,15 +70,103 @@ class TrackCompressorUnittest : public testing::Test {
 
     storage_ = context_.storage.get();
     tracker_ = context_.track_compressor.get();
+    track_tracker_ = context_.track_tracker.get();
   }
 
  protected:
   TraceStorage* storage_ = nullptr;
   TrackCompressor* tracker_ = nullptr;
+  TrackTracker* track_tracker_ = nullptr;
 
  private:
   TraceProcessorContext context_;
 };
+
+TEST_F(TrackCompressorUnittest, AdditionalDimensionsInEveryLane) {
+  auto factory = [&] {
+    ArgsTracker::CompactArgSet dimensions;
+    for (uint32_t i = 0; i < 25; ++i) {
+      StringId key =
+          storage_->InternString("custom_dimension.d" + std::to_string(i));
+      dimensions.emplace_back(
+          ArgsTracker::CompactArg{key, key, Variadic::Integer(i)});
+    }
+    return tracker_->CreateTrackFactoryWithDimensions(
+        kNestable, tracks::Dimensions(1), std::move(dimensions), 123);
+  }();
+  TrackId first = tracker_->Begin(factory, 1);
+  TrackId second = tracker_->Begin(factory, 2);
+  ASSERT_NE(first, second);
+  EXPECT_EQ(storage_->arg_table().row_count(), 54u);
+  ArgExtractor extractor(storage_->arg_table());
+  for (TrackId id : {first, second}) {
+    auto rr = storage_->track_table()[id];
+    ASSERT_EQ(rr.upid(), 1u);
+    ASSERT_TRUE(rr.dimension_arg_set_id());
+    for (uint32_t i = 0; i < 25; ++i) {
+      std::string key = "custom_dimension.d" + std::to_string(i);
+      ASSERT_NE(extractor.Get(*rr.dimension_arg_set_id(), key.c_str()),
+                std::numeric_limits<uint32_t>::max());
+      EXPECT_EQ(GetArgValue(*storage_, extractor.cursor()),
+                Variadic::Integer(i));
+    }
+    EXPECT_EQ(
+        extractor.Get(*rr.dimension_arg_set_id(), "custom_dimensions_hash"),
+        std::numeric_limits<uint32_t>::max());
+  }
+}
+
+TEST_F(TrackCompressorUnittest, AdditionalDimensionsPartitionInterning) {
+  StringId key = storage_->InternString("custom_dimension.rank");
+  ArgsTracker::CompactArg integer{key, key, Variadic::Integer(3)};
+  ArgsTracker::CompactArg string{key, key,
+                                 Variadic::String(storage_->InternString("3"))};
+  constexpr auto bp = tracks::SliceBlueprint("additional");
+  TrackId first = track_tracker_->InternTrackWithDimensions(
+      bp, tracks::Dimensions(), {&integer, 1, 100});
+  EXPECT_EQ(first, track_tracker_->InternTrackWithDimensions(
+                       bp, tracks::Dimensions(), {&integer, 1, 100}));
+  EXPECT_NE(first, track_tracker_->InternTrackWithDimensions(
+                       bp, tracks::Dimensions(), {&string, 1, 200}));
+  EXPECT_NE(first, track_tracker_->InternTrack(bp));
+}
+
+TEST_F(TrackCompressorUnittest, DisplayLabelsDoNotPartitionLanes) {
+  StringId key = storage_->InternString("custom_dimension.rank");
+  ArgsTracker::CompactArgSet dimensions;
+  dimensions.emplace_back(
+      ArgsTracker::CompactArg{key, key, Variadic::Integer(3)});
+  StringId display_key =
+      storage_->InternString("custom_dimension_display_name.rank");
+  StringId description_key = storage_->InternString("description");
+  auto first = tracker_->CreateTrackFactoryWithDimensions(
+      kNestable, tracks::Dimensions(1), dimensions, 100,
+      tracks::BlueprintName(), [&](ArgsInserter& args) {
+        args.AddArg(display_key,
+                    Variadic::String(storage_->InternString("east")));
+        args.AddArg(description_key,
+                    Variadic::String(storage_->InternString("description")));
+      });
+  auto second = tracker_->CreateTrackFactoryWithDimensions(
+      kNestable, tracks::Dimensions(1), dimensions, 100,
+      tracks::BlueprintName(), [&](ArgsInserter& args) {
+        args.AddArg(display_key,
+                    Variadic::String(storage_->InternString("west")));
+      });
+  TrackId id = tracker_->Scoped(first, 1, 1);
+  EXPECT_EQ(id, tracker_->Scoped(second, 2, 1));
+  auto rr = storage_->track_table()[id];
+  ArgExtractor extractor(storage_->arg_table());
+  ASSERT_NE(extractor.Get(*rr.source_arg_set_id(),
+                          "custom_dimension_display_name.rank"),
+            std::numeric_limits<uint32_t>::max());
+  EXPECT_EQ(GetArgValue(*storage_, extractor.cursor()),
+            Variadic::String(storage_->InternString("east")));
+  ASSERT_NE(extractor.Get(*rr.source_arg_set_id(), "description"),
+            std::numeric_limits<uint32_t>::max());
+  EXPECT_EQ(GetArgValue(*storage_, extractor.cursor()),
+            Variadic::String(storage_->InternString("description")));
+}
 
 TEST_F(TrackCompressorUnittest, Smoke) {
   auto begin = tracker_->InternBegin(kUnnestable, tracks::Dimensions(1), 1);

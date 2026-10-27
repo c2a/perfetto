@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <type_traits>
 #include <vector>
 
@@ -87,6 +88,12 @@ class ArgsTracker {
   ArgsInserter AddArgsTo(TrackId id);
   ArgsInserter AddArgsToProcess(UniquePid id);
   ArgsInserter AddArgsToThread(UniqueTid id);
+
+  // Returns a new immutable arg set with |args| added to |base|. Existing
+  // keys follow each argument's update policy; |base| is left unchanged.
+  ArgSetId ExtendArgSet(std::optional<ArgSetId> base,
+                        const CompactArg* args,
+                        uint32_t count);
 
   // Interns the arg set formed by |args| and returns its id. Keys in |args|
   // must be unique.

@@ -439,10 +439,6 @@ class TrackEventTracker {
       s = descriptor_tracks_state_.Find(uuid);
       PERFETTO_CHECK(s);
       s->track_id_or_factory = std::move(res);
-      // Merged tracks record their dimensions as they are created instead.
-      if (auto* track_id = std::get_if<TrackId>(&*s->track_id_or_factory)) {
-        RecordTrackDimensions(uuid, *track_id);
-      }
     }
     return s;
   }
@@ -465,10 +461,8 @@ class TrackEventTracker {
                     bool,
                     ArgsInserter&);
 
-  // Writes the custom dimensions of the descriptor |uuid| (see
-  // |ResolveDimensions|) to the track dimension table for |track_id|, a track
-  // created for that descriptor.
-  void RecordTrackDimensions(uint64_t uuid, TrackId track_id);
+  ArgsTracker::CompactArgSet GetDimensionArgs(uint64_t uuid);
+  ArgsTracker::CompactArgSet GetDimensionDisplayArgs(uint64_t uuid);
 
   // Returns the custom dimensions of the descriptor |uuid|: the ones of its
   // parent plus the ones it declares itself. A declared value conflicting with
@@ -491,8 +485,7 @@ class TrackEventTracker {
 
   std::unordered_set<uint32_t> sequences_with_first_packet_;
 
-  // Whether any descriptor declared custom dimensions: if none did, no track
-  // has any and |RecordTrackDimensions| has nothing to do.
+  // Whether any descriptor declared custom dimensions.
   bool has_dimensions_ = false;
 
   const StringId source_key_;

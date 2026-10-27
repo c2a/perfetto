@@ -41,7 +41,8 @@ TrackId TrackTracker::AddTrack(const tracks::BlueprintBase& blueprint,
                                StringId description,
                                ArgsTracker::CompactArg* d_args,
                                uint32_t d_size,
-                               const SetArgsCallback& args) {
+                               const SetArgsCallback& args,
+                               AdditionalDimensions additional) {
   tables::TrackTable::Row row(name);
   const auto* dims = blueprint.dimension_blueprints.data();
   for (uint32_t i = 0; i < d_size; ++i) {
@@ -62,7 +63,17 @@ TrackId TrackTracker::AddTrack(const tracks::BlueprintBase& blueprint,
   row.machine_id = context_->machine_id();
   row.type = context_->storage->InternString(
       base::StringView(blueprint.type.data(), blueprint.type.size()));
-  if (d_size > 0) {
+  if (additional.size > 0) {
+    ArgsTracker::CompactArgSet dimensions;
+    for (uint32_t i = 0; i < d_size; ++i) {
+      dimensions.emplace_back(d_args[i]);
+    }
+    for (uint32_t i = 0; i < additional.size; ++i) {
+      dimensions.emplace_back(additional.data[i]);
+    }
+    row.dimension_arg_set_id = context_->args_tracker->AddArgSet(
+        dimensions.data(), static_cast<uint32_t>(dimensions.size()));
+  } else if (d_size > 0) {
     row.dimension_arg_set_id =
         context_->args_tracker->AddArgSet(d_args, d_size);
   }

@@ -18526,10 +18526,12 @@ message StateDescriptor {}
 
 // A named, typed key/value which is part of a track's identity.
 //
-// Dimensions are the single vocabulary for identifiers which apply to a set of
-// tracks: *well-known* dimensions are synthesized by trace processor, while
-// producers can declare their own *custom* dimensions (`rank`, `shard`,
-// `stage`, ...) on a TrackDescriptor.
+// Producers can declare *custom* dimensions (`rank`, `shard`, `stage`, ...)
+// on a TrackDescriptor. Trace processor exposes their effective values in
+// `track.dimension_arg_set_id` as args with keys `custom_dimension.<name>`.
+// Presentation-only labels are stored in `track.source_arg_set_id` with keys
+// `custom_dimension_display_name.<name>`. Built-in dimensions are already
+// available through track columns and the other dimension args.
 //
 // Reserved names: the names of the well-known dimensions are reserved and
 // cannot be used for custom dimensions. They are:
